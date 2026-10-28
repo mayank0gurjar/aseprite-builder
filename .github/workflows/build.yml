@@ -1,4 +1,5 @@
-﻿name: Build Aseprite
+name: Build Aseprite
+
 on:
   workflow_dispatch:
 
@@ -31,13 +32,13 @@ jobs:
           }
           echo "DOWNLOAD_URL=$($asset.browser_download_url)" >> $env:GITHUB_ENV
           echo "ASE_VER=$($resp.tag_name)" >> $env:GITHUB_ENV
-          echo "Detected Aseprite version: $($resp.tag_name)"
-          echo "Source asset: $($asset.name)"
+          Write-Host "Detected Aseprite version: $($resp.tag_name)"
+          Write-Host "Source asset: $($asset.name)"
 
       - name: Download & Extract Source
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri ${{ env.DOWNLOAD_URL }} -OutFile "aseprite_src.zip" -UseBasicParsing
+          Invoke-WebRequest -Uri "${{ env.DOWNLOAD_URL }}" -OutFile "aseprite_src.zip" -UseBasicParsing
           Expand-Archive -Force "aseprite_src.zip" "temp_ext"
           $rootFile = Get-ChildItem -Path "temp_ext" -Filter "CMakeLists.txt" -Recurse | Select-Object -First 1
           mkdir aseprite -Force
@@ -63,6 +64,7 @@ jobs:
           $abs_build = Join-Path $env:GITHUB_WORKSPACE "build"
           mkdir $abs_build -Force
           Set-Location $abs_build
+          
           cmake -G Ninja `
             -DCMAKE_BUILD_TYPE=RelWithDebInfo `
             -DLAF_BACKEND=skia `
@@ -72,28 +74,19 @@ jobs:
             -DENABLE_UPDATER=OFF `
             -DENABLE_TESTS=OFF `
             "$abs_src"
+          
+          if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed with exit code $LASTEXITCODE" }
           Write-Host "CMake configuration completed"
 
       - name: Compile with Ninja
-        run: |
-          cd build
-          $cpuCount = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
-          $jobs = [math]::Min($cpuCount * 2, 8)
-          Write-Host "Using $jobs parallel compilation jobs"
-          ninja -j $jobs
-
-      - name: Collect Dependencies (DLLs)
         shell: powershell
         run: |
-          $binDir = "$env:GITHUB_WORKSPACE\build\bin"
-          $sslDir = "C:\Program Files\OpenSSL\bin"
-          if (Test-Path "$sslDir\libcrypto-3-x64.dll") {
-              Copy-Item "$sslDir\libcrypto-3-x64.dll" -Destination $binDir -Force
-              Copy-Item "$sslDir\libssl-3-x64.dll" -Destination $binDir -Force
-              echo "[+] DLLs copied to $binDir"
-          } else {
-              echo "[!] OpenSSL DLLs not found - skipping"
-          }
+          Set-Location "$env:GITHUB_WORKSPACE\build"
+          $cpuCount = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+          $jobs = [math]::Min($cpuCount, 4)  # Lowered max jobs slightly to prevent out-of-memory errors on runner
+          Write-Host "Using $jobs parallel compilation jobs"
+          ninja -j $jobs
+          if ($LASTEXITCODE -ne 0) { throw "Ninja compilation failed with exit code $LASTEXITCODE" }
 
       - name: Package Installer (Inno Setup)
         shell: powershell
@@ -116,7 +109,14 @@ jobs:
           "@
           mkdir installer -Force
           $iss | Out-File -FilePath "aseprite.iss" -Encoding utf8
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" aseprite.iss
+          
+          # Locate ISCC dynamically just in case choco installed it elsewhere
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+              $iscc = & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc aseprite.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -126,7 +126,7 @@ jobs:
           name: Aseprite ${{ env.ASE_VER }}
           files: installer/*.exe
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
