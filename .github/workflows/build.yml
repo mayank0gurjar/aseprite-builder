@@ -8,14 +8,17 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Enable Long Paths
+        shell: powershell
         run: git config --system core.longpaths true
 
       - name: Install Build Tools
+        shell: powershell
         run: choco install cmake ninja innosetup -y --no-progress
 
       - name: Fetch Latest Release Metadata
@@ -24,36 +27,91 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $headers = @{}
-          if ($env:GH_TOKEN) { $headers["Authorization"] = "token $env:GH_TOKEN" }
-          $resp = (Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri https://api.github.com/repos/aseprite/aseprite/releases/latest -ErrorAction Stop).Content | ConvertFrom-Json
-          $asset = $resp.assets | Where-Object { $_.name -like "*Source.zip" } | Select-Object -First 1
-          if (-not $asset) {
-              $asset = $resp.assets | Select-Object -First 1
+          if ($env:GH_TOKEN) {
+            $headers["Authorization"] = "Bearer $env:GH_TOKEN"
           }
-          echo "DOWNLOAD_URL=$($asset.browser_download_url)" >> $env:GITHUB_ENV
-          echo "ASE_VER=$($resp.tag_name)" >> $env:GITHUB_ENV
-          Write-Host "Detected Aseprite version: $($resp.tag_name)"
+
+          $resp = (Invoke-WebRequest -UseBasicParsing -Headers $headers `
+            -Uri "https://api.github.com/repos/aseprite/aseprite/releases/latest").Content |
+            ConvertFrom-Json
+
+          $asset = $resp.assets |
+            Where-Object { $_.name -like "*Source.zip" } |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            throw "Could not find Aseprite Source.zip in the latest release."
+          }
+
+          "DOWNLOAD_URL=$($asset.browser_download_url)" >> $env:GITHUB_ENV
+          "ASE_VER=$($resp.tag_name)" >> $env:GITHUB_ENV
+
+          Write-Host "Aseprite version: $($resp.tag_name)"
           Write-Host "Source asset: $($asset.name)"
 
       - name: Download & Extract Source
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "${{ env.DOWNLOAD_URL }}" -OutFile "aseprite_src.zip" -UseBasicParsing
-          Expand-Archive -Force "aseprite_src.zip" "temp_ext"
-          $rootFile = Get-ChildItem -Path "temp_ext" -Filter "CMakeLists.txt" -Recurse | Select-Object -First 1
-          mkdir aseprite -Force
-          Get-ChildItem -Path "$($rootFile.Directory.FullName)\*" | Move-Item -Destination "aseprite" -Force
-          Write-Host "Source extracted successfully"
+          Invoke-WebRequest -Uri "$env:DOWNLOAD_URL" `
+            -OutFile "aseprite_src.zip" -UseBasicParsing
 
-      - name: Download & Extract Skia
-        shell: powershell
+          Expand-Archive -Force "aseprite_src.zip" "temp_ext"
+
+          $rootFile = Get-ChildItem -Path "temp_ext" `
+            -Filter "CMakeLists.txt" -Recurse |
+            Select-Object -First 1
+
+          if (-not $rootFile) {
+            throw "Could not locate Aseprite CMakeLists.txt."
+          }
+
+          New-Item -ItemType Directory -Force -Path "aseprite" | Out-Null
+
+          Get-ChildItem -Path $rootFile.Directory.FullName |
+            Move-Item -Destination "aseprite" -Force
+
+          Write-Host "Source extracted successfully."
+
+      - name: Download Matching Prebuilt Skia
+        shell: bash
         run: |
-          # Aseprite m102 requires the specific skia fork & branch/commit
-          git clone -c core.longpaths=true --depth 1 -b m102-861e4743af https://github.com/aseprite/skia.git skia
-          Write-Host "Skia repository cloned successfully"
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/aseprite"
+
+          if [ ! -f laf/misc/skia-url.sh ]; then
+            echo "::error::This source archive does not contain laf/misc/skia-url.sh."
+            exit 1
+          fi
+
+          SKIA_URL="$(bash laf/misc/skia-url.sh Release)"
+          echo "Skia URL: $SKIA_URL"
+
+          mkdir -p "$GITHUB_WORKSPACE/skia"
+
+          curl --fail --location --retry 3 \
+            "$SKIA_URL" \
+            -o "$GITHUB_WORKSPACE/skia/skia.zip"
+
+          unzip -q "$GITHUB_WORKSPACE/skia/skia.zip" \
+            -d "$GITHUB_WORKSPACE/skia"
+
+          if [ ! -f "$GITHUB_WORKSPACE/skia/third_party/externals/icu/flutter/icudtl.dat" ]; then
+            echo "::error::Downloaded Skia package is missing icudtl.dat or has a different directory layout."
+            exit 1
+          fi
+
+          if [ ! -f "$GITHUB_WORKSPACE/skia/out/Release-x64/skia.lib" ]; then
+            echo "::error::Downloaded Skia package is missing skia.lib."
+            exit 1
+          fi
+
+          echo "Skia package verified."
 
       - name: Initialize MSVC Environment
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Run CMake Configuration
         shell: powershell
@@ -61,9 +119,14 @@ jobs:
           $abs_src = Join-Path $env:GITHUB_WORKSPACE "aseprite"
           $abs_skia = Join-Path $env:GITHUB_WORKSPACE "skia"
           $abs_build = Join-Path $env:GITHUB_WORKSPACE "build"
-          mkdir $abs_build -Force
+
+          if (Test-Path $abs_build) {
+            Remove-Item -Recurse -Force $abs_build
+          }
+
+          New-Item -ItemType Directory -Force -Path $abs_build | Out-Null
           Set-Location $abs_build
-          
+
           cmake -G Ninja `
             -DCMAKE_BUILD_TYPE=RelWithDebInfo `
             -DLAF_BACKEND=skia `
@@ -73,24 +136,34 @@ jobs:
             -DENABLE_UPDATER=OFF `
             -DENABLE_TESTS=OFF `
             "$abs_src"
-          
-          if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed with exit code $LASTEXITCODE" }
-          Write-Host "CMake configuration completed"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configuration failed."
+          }
 
       - name: Compile with Ninja
         shell: powershell
         run: |
           Set-Location "$env:GITHUB_WORKSPACE\build"
-          $cpuCount = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
-          $jobs = [math]::Min($cpuCount, 4)  # Lowered max jobs slightly to prevent out-of-memory errors on runner
-          Write-Host "Using $jobs parallel compilation jobs"
-          ninja -j $jobs
-          if ($LASTEXITCODE -ne 0) { throw "Ninja compilation failed with exit code $LASTEXITCODE" }
 
-      - name: Package Installer (Inno Setup)
+          $cpuCount = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+          $jobs = [math]::Min($cpuCount, 4)
+
+          ninja -j $jobs
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ninja compilation failed."
+          }
+
+      - name: Package Installer
         shell: powershell
         run: |
           $binPath = Join-Path $env:GITHUB_WORKSPACE "build\bin"
+
+          if (-not (Test-Path "$binPath\aseprite.exe")) {
+            throw "aseprite.exe was not generated."
+          }
+
           $iss = @"
           [Setup]
           AppName=Aseprite
@@ -101,21 +174,28 @@ jobs:
           OutputDir=installer
           Compression=lzma
           SolidCompression=yes
+
           [Files]
           Source: "$binPath\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
           [Icons]
           Name: "{group}\Aseprite"; Filename: "{app}\aseprite.exe"
           "@
-          mkdir installer -Force
+
+          New-Item -ItemType Directory -Force -Path "installer" | Out-Null
           $iss | Out-File -FilePath "aseprite.iss" -Encoding utf8
-          
-          # Locate ISCC dynamically just in case choco installed it elsewhere
-          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+
           if (-not (Test-Path $iscc)) {
-              $iscc = & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            throw "Inno Setup compiler not found at $iscc"
           }
-          & $iscc aseprite.iss
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
+
+          & $iscc "aseprite.iss"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed."
+          }
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -125,10 +205,11 @@ jobs:
           name: Aseprite ${{ env.ASE_VER }}
           files: installer/*.exe
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Aseprite-Installer
           path: installer/*.exe
+          if-no-files-found: error
